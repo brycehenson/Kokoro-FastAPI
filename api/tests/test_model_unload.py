@@ -37,6 +37,7 @@ def _enable_dev_unload(monkeypatch):
     """Enable the /dev/unload gate for the endpoint tests in this module."""
     monkeypatch.setattr(settings, "allow_dev_unload", True)
     monkeypatch.setattr(settings, "model_auto_unload_timeout_seconds", 0.0)
+    monkeypatch.setattr(settings, "model_unload_strategy", "destroy")
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,80 @@ async def test_unload_clears_backend():
 
     mock_backend.unload.assert_called_once()
     assert manager._backend is None
+
+
+@pytest.mark.asyncio
+async def test_unload_move_to_cpu_keeps_backend(monkeypatch):
+    monkeypatch.setattr(settings, "use_gpu", True)
+    monkeypatch.setattr(settings, "model_unload_strategy", "move_to_cpu")
+
+    manager = ModelManager()
+    mock_backend = MagicMock()
+    mock_backend.is_loaded = True
+    mock_backend.is_cpu_cached = True
+    manager._backend = mock_backend
+
+    with patch("api.src.inference.model_manager.torch") as mock_torch:
+        mock_torch.cuda.is_available.return_value = False
+        await manager.unload()
+
+    mock_backend.unload.assert_called_once_with(strategy="move_to_cpu")
+    assert manager._backend is mock_backend
+
+
+def test_move_to_cpu_strategy_warns_and_uses_destroy_without_gpu(monkeypatch):
+    monkeypatch.setattr(settings, "use_gpu", False)
+    monkeypatch.setattr(settings, "model_unload_strategy", "move_to_cpu")
+
+    manager = ModelManager()
+
+    with patch("api.src.inference.model_manager.logger.warning") as mock_warning:
+        assert manager._unload_strategy() == "destroy"
+
+    mock_warning.assert_called_once_with(
+        "MODEL_UNLOAD_STRATEGY=move_to_cpu requires USE_GPU=true; using destroy"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unload_move_to_cpu_destroys_backend_without_gpu(monkeypatch):
+    monkeypatch.setattr(settings, "use_gpu", False)
+    monkeypatch.setattr(settings, "model_unload_strategy", "move_to_cpu")
+
+    manager = ModelManager()
+    mock_backend = MagicMock()
+    mock_backend.is_loaded = True
+    mock_backend.is_cpu_cached = True
+    manager._backend = mock_backend
+
+    with patch("api.src.inference.model_manager.torch") as mock_torch:
+        mock_torch.cuda.is_available.return_value = False
+        await manager.unload()
+
+    mock_backend.unload.assert_called_once_with(strategy="destroy")
+    assert manager._backend is None
+
+
+@pytest.mark.asyncio
+async def test_reload_restores_cpu_cached_backend(monkeypatch):
+    monkeypatch.setattr(settings, "use_gpu", True)
+    monkeypatch.setattr(settings, "model_unload_strategy", "move_to_cpu")
+
+    manager = ModelManager()
+    mock_backend = MagicMock()
+    mock_backend.is_loaded = True
+    mock_backend.is_cpu_cached = True
+    manager._backend = mock_backend
+
+    with (
+        patch.object(manager, "initialize", new_callable=AsyncMock) as mock_init,
+        patch.object(manager, "load_model", new_callable=AsyncMock) as mock_load,
+    ):
+        await manager.reload()
+
+    mock_backend.restore_to_device.assert_called_once()
+    mock_init.assert_not_called()
+    mock_load.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -320,10 +395,33 @@ def test_status_reports_model_lifecycle_state(monkeypatch):
     assert status["device"] == "cuda"
     assert status["loaded"] is True
     assert status["active_requests"] == 0
+    assert status["unload_strategy"] == "destroy"
+    assert status["cpu_cached"] is False
     assert status["auto_unload_enabled"] is True
     assert status["auto_unload_timeout_seconds"] == 30.0
     assert status["idle_seconds"] == 5.0
     assert status["seconds_until_auto_unload"] == 25.0
+
+
+def test_status_reports_cpu_cached_state(monkeypatch):
+    monkeypatch.setattr(settings, "use_gpu", True)
+    monkeypatch.setattr(settings, "model_unload_strategy", "move_to_cpu")
+    monkeypatch.setattr(settings, "model_auto_unload_timeout_seconds", 30.0)
+
+    manager = ModelManager()
+    mock_backend = MagicMock()
+    mock_backend.is_loaded = True
+    mock_backend.is_cpu_cached = True
+    manager._backend = mock_backend
+    manager._last_used_at = 10.0
+
+    with patch("api.src.inference.model_manager.time.monotonic", return_value=15.0):
+        status = manager.status()
+
+    assert status["loaded"] is False
+    assert status["cpu_cached"] is True
+    assert status["unload_strategy"] == "move_to_cpu"
+    assert status["seconds_until_auto_unload"] is None
 
 
 # ---------------------------------------------------------------------------
